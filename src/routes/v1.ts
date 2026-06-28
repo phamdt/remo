@@ -4,7 +4,7 @@ import {
   continueRunRequestSchema,
   createRunRequestSchema,
 } from "../api-schema.js";
-import { bearerAuth } from "../middleware/auth.js";
+import { bearerAuth, extractBearerToken } from "../middleware/auth.js";
 import type { RunService } from "../services/run-service.js";
 import { runEventBus } from "../services/event-bus.js";
 import type { SseEvent } from "../types.js";
@@ -23,12 +23,17 @@ export function createV1Routes(runService: RunService, token: string) {
     if (!body.success) {
       return c.json({ error: "Invalid request", details: body.error.flatten() }, 400);
     }
+    const bearerToken = extractBearerToken(c);
+    if (!bearerToken) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
     try {
-      const result = runService.createRun(body.data);
+      const result = runService.createRun(body.data, bearerToken);
       return c.json(result, 201);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create run";
-      return c.json({ error: message }, 400);
+      const status = message.includes("Apply mode") ? 403 : 400;
+      return c.json({ error: message }, status);
     }
   });
 

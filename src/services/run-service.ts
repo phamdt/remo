@@ -13,6 +13,7 @@ import {
   hasChanges,
   pushBranch,
 } from "../git/worktree.js";
+import { safeEqualToken } from "../middleware/auth.js";
 import {
   getDbPath,
   getRepoCacheDir,
@@ -20,9 +21,13 @@ import {
   runCursorStateDir,
   runDir,
   runEventsPath,
+  runResultHandle,
   runResultPath,
   runWorkspaceDir,
 } from "../paths.js";
+import { clientErrorMessage } from "../security/errors.js";
+import { getMaxConcurrentRuns, getRunTimeoutMs } from "../security/limits.js";
+import type { AppSecrets } from "../security/secrets.js";
 import { runEventBus } from "./event-bus.js";
 import type { RunRecord, RunRepoRow, RunStatus, RunSummary } from "../types.js";
 
@@ -34,33 +39,31 @@ type ActiveRun = {
 export type RunServiceDeps = {
   db: RunDatabase;
   runner: AgentRunner;
+  secrets: AppSecrets;
   configDir?: string;
   repoCacheDir?: string;
-  modelId?: string;
-  apiKey?: string;
   timeoutMs?: number;
+  maxConcurrentRuns?: number;
 };
 
 export class RunService {
   private readonly db: RunDatabase;
   private readonly runner: AgentRunner;
+  private readonly secrets: AppSecrets;
   private readonly configDir?: string;
   private readonly repoCacheDir: string;
-  private readonly modelId: string;
-  private readonly apiKey: string;
   private readonly timeoutMs: number;
+  private readonly maxConcurrentRuns: number;
   private readonly active = new Map<string, ActiveRun>();
 
   constructor(deps: RunServiceDeps) {
     this.db = deps.db;
     this.runner = deps.runner;
+    this.secrets = deps.secrets;
     this.configDir = deps.configDir;
     this.repoCacheDir = deps.repoCacheDir ?? getRepoCacheDir();
-    this.modelId =
-      deps.modelId ?? process.env.CURSOR_MODEL_ID ?? "claude-4-sonnet";
-    this.apiKey = deps.apiKey ?? process.env.CURSOR_API_KEY ?? "";
-    this.timeoutMs =
-      deps.timeoutMs ?? Number(process.env.RUN_TIMEOUT_MS ?? 1_800_000);
+    this.timeoutMs = deps.timeoutMs ?? getRunTimeoutMs();
+    this.maxConcurrentRuns = deps.maxConcurrentRuns ?? getMaxConcurrentRuns();
   }
 
   listWorkspaces() {
@@ -76,9 +79,21 @@ export class RunService {
     }));
   }
 
-  createRun(request: CreateRunRequest): { id: string } {
-    if (!this.apiKey) {
+  createRun(request: CreateRunRequest, bearerToken: string): { id: string } {
+    if (!this.secrets.cursorApiKey) {
       throw new Error("CURSOR_API_KEY is not configured");
+    }
+
+    if (
+      request.mode === "apply" &&
+      this.secrets.remoteAgentApplyToken &&
+      !safeEqualToken(bearerToken, this.secrets.remoteAgentApplyToken)
+    ) {
+      throw new Error("Apply mode requires REMOTE_AGENT_APPLY_TOKEN");
+    }
+
+    if (this.active.size >= this.maxConcurrentRuns) {
+      throw new Error("Too many concurrent runs");
     }
 
     const workspace = getWorkspaceById(request.workspaceId, this.configDir);
@@ -127,6 +142,9 @@ export class RunService {
     if (!["completed", "failed", "cancelled"].includes(run.status)) {
       throw new Error(`Cannot continue run in status ${run.status}`);
     }
+    if (this.active.size >= this.maxConcurrentRuns) {
+      throw new Error("Too many concurrent runs");
+    }
     const workspace = getWorkspaceById(run.workspaceId, this.configDir);
     this.updateStatus(id, "queued");
     this.startRun(id, prompt, workspace.defaultPromptContext);
@@ -137,10 +155,10 @@ export class RunService {
     if (active) {
       active.abortController.abort();
     }
-    this.updateStatus(id, "cancelled");
+    this.finalizeRun(id, "cancelled");
     runEventBus.publish(
       id,
-      { type: "status", status: "cancelled" },
+      { type: "result", ok: false },
       runEventsPath(id),
     );
   }
@@ -164,7 +182,7 @@ export class RunService {
         branch: r.branch ?? undefined,
         prUrl: r.prUrl ?? undefined,
       })),
-      resultPath: resultExists ? runResultPath(id) : undefined,
+      resultPath: resultExists ? runResultHandle(id) : undefined,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
     };
@@ -182,6 +200,13 @@ export class RunService {
     const updatedAt = new Date().toISOString();
     this.db.updateStatus(id, status, updatedAt);
     runEventBus.publish(id, { type: "status", status }, runEventsPath(id));
+  }
+
+  private finalizeRun(id: string, status: RunStatus): void {
+    this.updateStatus(id, status);
+    if (["completed", "failed", "cancelled"].includes(status)) {
+      runEventBus.dispose(id);
+    }
   }
 
   private startRun(
@@ -225,14 +250,14 @@ export class RunService {
         prompt,
         promptContext,
         eventsPath: runEventsPath(run.id),
-        modelId: this.modelId,
-        apiKey: this.apiKey,
+        modelId: this.secrets.modelId,
+        apiKey: this.secrets.cursorApiKey,
         timeoutMs: this.timeoutMs,
         signal,
       });
 
       if (signal.aborted || result.error === "cancelled") {
-        this.updateStatus(run.id, "cancelled");
+        this.finalizeRun(run.id, "cancelled");
         runEventBus.publish(
           run.id,
           { type: "result", ok: false },
@@ -242,12 +267,25 @@ export class RunService {
       }
 
       if (!result.ok) {
-        this.updateStatus(run.id, "failed");
+        this.finalizeRun(run.id, "failed");
         runEventBus.publish(
           run.id,
-          { type: "error", message: result.error ?? "run failed" },
+          {
+            type: "error",
+            message: result.error ?? "Run failed",
+          },
           runEventsPath(run.id),
         );
+        runEventBus.publish(
+          run.id,
+          { type: "result", ok: false },
+          runEventsPath(run.id),
+        );
+        return;
+      }
+
+      if (signal.aborted) {
+        this.finalizeRun(run.id, "cancelled");
         runEventBus.publish(
           run.id,
           { type: "result", ok: false },
@@ -262,22 +300,31 @@ export class RunService {
         "utf8",
       );
 
-      if (run.mode === "apply") {
-        await this.publishChanges(run);
+      if (run.mode === "apply" && !signal.aborted) {
+        await this.publishChanges(run, signal);
       }
 
-      this.updateStatus(run.id, "completed");
+      if (signal.aborted) {
+        this.finalizeRun(run.id, "cancelled");
+        runEventBus.publish(
+          run.id,
+          { type: "result", ok: false },
+          runEventsPath(run.id),
+        );
+        return;
+      }
+
+      this.finalizeRun(run.id, "completed");
       runEventBus.publish(
         run.id,
         { type: "result", ok: true },
         runEventsPath(run.id),
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : "run failed";
-      this.updateStatus(run.id, "failed");
+      this.finalizeRun(run.id, "failed");
       runEventBus.publish(
         run.id,
-        { type: "error", message },
+        { type: "error", message: clientErrorMessage(error, "run") },
         runEventsPath(run.id),
       );
       runEventBus.publish(
@@ -305,11 +352,18 @@ export class RunService {
     }
   }
 
-  private async publishChanges(run: RunRecord): Promise<void> {
+  private async publishChanges(
+    run: RunRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
     const repos = this.db.listRunRepos(run.id);
     const branches: Record<string, { branch: string; prUrl?: string }> = {};
 
     for (const row of repos) {
+      if (signal.aborted) {
+        return;
+      }
+
       const worktreePath = path.join(runWorkspaceDir(run.id), row.path);
       const branch = row.branch ?? `cursor/${run.id}-${row.role}`;
       const dirty = await hasChanges(worktreePath);
@@ -318,7 +372,16 @@ export class RunService {
       }
 
       await commitAllIfDirty(worktreePath, `cursor: ${run.id} (${row.role})`);
+
+      if (signal.aborted) {
+        return;
+      }
+
       await pushBranch(worktreePath, branch);
+
+      if (signal.aborted) {
+        return;
+      }
 
       const prUrl = await createPullRequest({
         cwd: worktreePath,
@@ -332,16 +395,18 @@ export class RunService {
       branches[row.repoId] = { branch, prUrl: prUrl ?? undefined };
     }
 
-    fs.writeFileSync(
-      runBranchesPath(run.id),
-      JSON.stringify(branches, null, 2),
-      "utf8",
-    );
+    if (!signal.aborted) {
+      fs.writeFileSync(
+        runBranchesPath(run.id),
+        JSON.stringify(branches, null, 2),
+        "utf8",
+      );
+    }
   }
 }
 
-export function createRunService(): RunService {
+export function createRunService(secrets: AppSecrets): RunService {
   fs.mkdirSync(path.dirname(getDbPath()), { recursive: true });
   const db = new RunDatabase(getDbPath());
-  return new RunService({ db, runner: agentRunner });
+  return new RunService({ db, runner: agentRunner, secrets });
 }

@@ -70,4 +70,19 @@ describe("v1 routes", () => {
     const body = (await res.json()) as { id: string };
     expect(body.id).toBe("run_123");
   });
+
+  it("rejects invalid baseRef in create run request", async () => {
+    const app = createV1Routes(mockRunService(), token);
+    const res = await app.request("/runs", {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "demo-workspace",
+        mode: "plan_only",
+        prompt: "Summarize the repo",
+        baseRef: "../escape",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
 });

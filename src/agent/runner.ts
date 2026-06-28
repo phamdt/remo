@@ -7,6 +7,8 @@ import {
   type Run as SdkRun,
 } from "@cursor/sdk";
 import { runAgentMetaPath } from "../paths.js";
+import { buildAgentHostEnv } from "../security/env.js";
+import { clientAgentErrorMessage } from "../security/errors.js";
 import type { RunMode } from "../types.js";
 import { runEventBus } from "../services/event-bus.js";
 
@@ -38,8 +40,42 @@ function mapMode(mode: RunMode): "plan" | "agent" {
   return mode === "plan_only" ? "plan" : "agent";
 }
 
+function withAgentHostEnv<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = { ...process.env };
+  const safe = buildAgentHostEnv();
+  for (const key of Object.keys(process.env)) {
+    delete process.env[key];
+  }
+  Object.assign(process.env, safe);
+  return fn().finally(() => {
+    for (const key of Object.keys(process.env)) {
+      delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  });
+}
+
 export class AgentRunner {
+  private agentRunQueue: Promise<unknown> = Promise.resolve();
+
   async run(options: AgentRunnerOptions): Promise<AgentRunnerResult> {
+    let release!: () => void;
+    const slot = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.agentRunQueue;
+    this.agentRunQueue = previous.then(() => slot);
+    await previous;
+    try {
+      return await withAgentHostEnv(async () => this.runWithSafeEnv(options));
+    } finally {
+      release();
+    }
+  }
+
+  private async runWithSafeEnv(
+    options: AgentRunnerOptions,
+  ): Promise<AgentRunnerResult> {
     const store = new JsonlLocalAgentStore(options.cursorStatePath);
     Cursor.configure({ local: { store } });
 
@@ -49,12 +85,18 @@ export class AgentRunner {
       ? `${options.promptContext}\n\n${options.prompt}`
       : options.prompt;
 
+    const localOptions = {
+      cwd: options.workspaceRoot,
+      store,
+      sandboxOptions: { enabled: true },
+    };
+
     if (fs.existsSync(metaPath)) {
       const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as AgentMeta;
       agent = await Agent.resume(meta.agentId, {
         apiKey: options.apiKey,
         model: { id: options.modelId },
-        local: { cwd: options.workspaceRoot, store },
+        local: localOptions,
         mode: mapMode(options.mode),
       });
     } else {
@@ -63,22 +105,28 @@ export class AgentRunner {
         model: { id: options.modelId },
         name: `run-${options.runId}`,
         mode: mapMode(options.mode),
-        local: { cwd: options.workspaceRoot, store },
+        local: localOptions,
       });
       const meta: AgentMeta = { agentId: agent.agentId };
       fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
     }
 
+    const combined = new AbortController();
+    const onParentAbort = () => combined.abort();
+    options.signal.addEventListener("abort", onParentAbort);
+
+    let sdkRun: SdkRun | undefined;
     const timeout = setTimeout(() => {
-      // cancellation handled by caller via AbortSignal
+      void sdkRun?.cancel();
+      combined.abort();
     }, options.timeoutMs);
 
     try {
-      if (options.signal.aborted) {
+      if (combined.signal.aborted) {
         return { ok: false, error: "cancelled" };
       }
 
-      const sdkRun: SdkRun = await agent.send(fullPrompt, {
+      sdkRun = await agent.send(fullPrompt, {
         mode: mapMode(options.mode),
         onDelta: ({ update }) => {
           if (update.type === "text-delta") {
@@ -114,11 +162,11 @@ export class AgentRunner {
       });
 
       const abortPromise = new Promise<never>((_, reject) => {
-        if (options.signal.aborted) {
+        if (combined.signal.aborted) {
           reject(new Error("cancelled"));
         }
-        options.signal.addEventListener("abort", () => {
-          void sdkRun.cancel();
+        combined.signal.addEventListener("abort", () => {
+          void sdkRun?.cancel();
           reject(new Error("cancelled"));
         });
       });
@@ -130,10 +178,10 @@ export class AgentRunner {
         error: result.status === "error" ? "agent error" : undefined,
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "agent failed";
-      return { ok: false, error: message };
+      return { ok: false, error: clientAgentErrorMessage(error) };
     } finally {
       clearTimeout(timeout);
+      options.signal.removeEventListener("abort", onParentAbort);
       agent.close();
     }
   }

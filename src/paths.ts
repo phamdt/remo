@@ -40,6 +40,11 @@ export function runResultPath(runId: string): string {
   return path.join(runDir(runId), "result.json");
 }
 
+/** Opaque client-facing handle — not an absolute filesystem path. */
+export function runResultHandle(runId: string): string {
+  return `runs/${runId}/result`;
+}
+
 export function runBranchesPath(runId: string): string {
   return path.join(runDir(runId), "branches.json");
 }

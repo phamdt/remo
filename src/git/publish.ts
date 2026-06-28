@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { buildGitEnv } from "../security/env.js";
+import { getSecrets } from "../security/secrets.js";
 
 export type GhExecResult = {
   stdout: string;
@@ -6,11 +8,21 @@ export type GhExecResult = {
   code: number;
 };
 
+export class GhCommandError extends Error {
+  constructor(
+    message: string,
+    readonly stderr: string,
+  ) {
+    super(message);
+    this.name = "GhCommandError";
+  }
+}
+
 export async function gh(args: string[], cwd: string): Promise<GhExecResult> {
   return new Promise((resolve, reject) => {
     const child = spawn("gh", args, {
       cwd,
-      env: process.env,
+      env: buildGitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -36,7 +48,7 @@ export async function createPullRequest(options: {
   title: string;
   body: string;
 }): Promise<string | null> {
-  if (!process.env.GITHUB_TOKEN && !process.env.GH_TOKEN) {
+  if (!getSecrets().githubToken) {
     return null;
   }
 
@@ -57,7 +69,7 @@ export async function createPullRequest(options: {
   );
 
   if (result.code !== 0) {
-    throw new Error(`gh pr create failed: ${result.stderr}`);
+    throw new GhCommandError("gh pr create failed", result.stderr);
   }
 
   return result.stdout.trim() || null;

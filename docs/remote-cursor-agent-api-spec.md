@@ -223,11 +223,17 @@ type SseEvent =
 
 - No arbitrary shell or file endpoints.
 - Repo/workspace IDs must exist in server config.
-- Per-run timeout and explicit cancellation.
+- Per-run timeout (`RUN_TIMEOUT_MS`) and explicit cancellation; cancel blocks git push/PR.
+- Max concurrent runs (`MAX_CONCURRENT_RUNS`, default 3).
 - One worktree per repo per run.
 - Mobile receives summaries and SSE — not full repo trees or Cursor state blobs.
 - Only repos with detected changes are pushed / PR-created.
 - `events.jsonl` is append-only for audit; treat `cursor-state/` as sensitive.
+- Secrets (`REMOTE_AGENT_TOKEN`, `CURSOR_API_KEY`, `GITHUB_TOKEN`) are scrubbed from `process.env` at startup; git/gh receive tokens via isolated env only.
+- Optional `REMOTE_AGENT_APPLY_TOKEN` restricts `mode: "apply"` runs to a separate bearer token.
+- Client `baseRef` must match `^[a-zA-Z0-9/._-]+$`.
+- SSE error events use generic messages; details are logged server-side only.
+- `resultPath` in summaries is an opaque handle (`runs/{id}/result`), not an absolute path.
 
 ## Out of scope (MVP)
 

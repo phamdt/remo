@@ -1,12 +1,23 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { buildGitEnv } from "../security/env.js";
 
 export type GitExecResult = {
   stdout: string;
   stderr: string;
   code: number;
 };
+
+export class GitCommandError extends Error {
+  constructor(
+    message: string,
+    readonly stderr: string,
+  ) {
+    super(message);
+    this.name = "GitCommandError";
+  }
+}
 
 export async function git(
   args: string[],
@@ -15,7 +26,7 @@ export async function git(
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {
       cwd,
-      env: process.env,
+      env: buildGitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -44,12 +55,12 @@ export async function ensureBareRepoCache(
     fs.mkdirSync(cacheDir, { recursive: true });
     const clone = await git(["clone", "--bare", url, barePath]);
     if (clone.code !== 0) {
-      throw new Error(`git clone failed for ${repoId}: ${clone.stderr}`);
+      throw new GitCommandError(`git clone failed for ${repoId}`, clone.stderr);
     }
   } else {
     const fetch = await git(["fetch", "--prune", "origin"], barePath);
     if (fetch.code !== 0) {
-      throw new Error(`git fetch failed for ${repoId}: ${fetch.stderr}`);
+      throw new GitCommandError(`git fetch failed for ${repoId}`, fetch.stderr);
     }
   }
   return barePath;
@@ -71,14 +82,14 @@ export async function addWorktree(
     barePath,
   );
   if (add.code !== 0) {
-    throw new Error(`git worktree add failed: ${add.stderr}`);
+    throw new GitCommandError("git worktree add failed", add.stderr);
   }
 }
 
 export async function hasChanges(worktreePath: string): Promise<boolean> {
   const status = await git(["status", "--porcelain"], worktreePath);
   if (status.code !== 0) {
-    throw new Error(`git status failed: ${status.stderr}`);
+    throw new GitCommandError("git status failed", status.stderr);
   }
   return status.stdout.trim().length > 0;
 }
@@ -94,12 +105,12 @@ export async function commitAllIfDirty(
 
   const add = await git(["add", "-A"], worktreePath);
   if (add.code !== 0) {
-    throw new Error(`git add failed: ${add.stderr}`);
+    throw new GitCommandError("git add failed", add.stderr);
   }
 
   const commit = await git(["commit", "-m", message], worktreePath);
   if (commit.code !== 0) {
-    throw new Error(`git commit failed: ${commit.stderr}`);
+    throw new GitCommandError("git commit failed", commit.stderr);
   }
   return true;
 }
@@ -110,7 +121,7 @@ export async function pushBranch(
 ): Promise<void> {
   const push = await git(["push", "-u", "origin", branch], worktreePath);
   if (push.code !== 0) {
-    throw new Error(`git push failed: ${push.stderr}`);
+    throw new GitCommandError("git push failed", push.stderr);
   }
 }
 

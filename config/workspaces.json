@@ -1,0 +1,10 @@
+[
+  {
+    "id": "demo-workspace",
+    "name": "Demo Workspace",
+    "repos": [
+      { "repoId": "demo-api", "role": "api", "path": "api" }
+    ],
+    "defaultPromptContext": "The repository lives under api/."
+  }
+]

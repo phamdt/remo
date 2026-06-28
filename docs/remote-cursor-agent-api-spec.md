@@ -25,7 +25,7 @@ flowchart LR
 
 | Area | Choice |
 | --- | --- |
-| Runtime | Node.js 22+, TypeScript strict |
+| Runtime | Node.js 24+ LTS, TypeScript strict |
 | HTTP | [Hono](https://hono.dev) — small surface, native SSE |
 | Validation | Zod (config + request bodies) |
 | Agent | `@cursor/sdk` (CLI fallback only if SDK gap) |
@@ -235,4 +235,4 @@ Postgres/Redis, multi-user auth, GitHub repo discovery, cloud runtime, object-st
 
 ## Windows dev notes
 
-Run the API locally with Node 22+ (nvm-windows or official installer). Use Git for Windows for worktree support. Point `REMOTE_AGENT_DATA` (or equivalent env) at a local folder instead of `/srv/remote-agent/`. SQLite and SSE work the same on Windows; deploy target remains Linux on GCP.
+Run the API locally with Node 24+ (nvm-windows or official installer). Use Git for Windows for worktree support. Point `REMOTE_AGENT_DATA` at the project root (contains `config/`, `data/`, `runs/`). SQLite and SSE work the same on Windows; deploy target remains Linux on GCP.

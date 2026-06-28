@@ -1,0 +1,9 @@
+[
+  {
+    "id": "demo-api",
+    "name": "Demo API",
+    "url": "https://github.com/octocat/Hello-World.git",
+    "defaultBranch": "master",
+    "enabled": true
+  }
+]

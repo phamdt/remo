@@ -233,6 +233,7 @@ type SseEvent =
 - Optional `REMOTE_AGENT_APPLY_TOKEN` restricts `mode: "apply"` runs to a separate bearer token.
 - Client `baseRef` must match `^[a-zA-Z0-9/._-]+$`.
 - SSE error events use generic messages; details are logged server-side only.
+- `SSE_MAX_WAIT_MS` caps how long event streams wait for terminal status (default: run timeout + 5 min).
 - `resultPath` in summaries is an opaque handle (`runs/{id}/result`), not an absolute path.
 
 ## Out of scope (MVP)

@@ -61,4 +61,30 @@ describe("config schemas", () => {
       ]),
     ).toThrow();
   });
+
+  it("rejects workspace repo path with traversal", () => {
+    expect(() =>
+      workspacesConfigSchema.parse([
+        {
+          id: "bad",
+          name: "Bad",
+          repos: [{ repoId: "demo-api", role: "api", path: "../escape" }],
+        },
+      ]),
+    ).toThrow();
+  });
+
+  it("rejects invalid defaultBranch in repos config", () => {
+    expect(() =>
+      reposConfigSchema.parse([
+        {
+          id: "demo-api",
+          name: "Demo",
+          url: "https://example.com/repo.git",
+          defaultBranch: "-bad",
+          enabled: true,
+        },
+      ]),
+    ).toThrow();
+  });
 });

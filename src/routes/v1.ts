@@ -4,7 +4,9 @@ import {
   continueRunRequestSchema,
   createRunRequestSchema,
 } from "../api-schema.js";
+import { httpStatusForError } from "../errors.js";
 import { bearerAuth, extractBearerToken } from "../middleware/auth.js";
+import { getSseMaxWaitMs } from "../security/limits.js";
 import type { RunService } from "../services/run-service.js";
 import { runEventBus } from "../services/event-bus.js";
 import type { SseEvent } from "../types.js";
@@ -32,8 +34,7 @@ export function createV1Routes(runService: RunService, token: string) {
       return c.json(result, 201);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create run";
-      const status = message.includes("Apply mode") ? 403 : 400;
-      return c.json({ error: message }, status);
+      return c.json({ error: message }, httpStatusForError(error));
     }
   });
 
@@ -66,14 +67,25 @@ export function createV1Routes(runService: RunService, token: string) {
         void send(event);
       });
 
+      const maxWaitMs = getSseMaxWaitMs();
+      const deadline = Date.now() + maxWaitMs;
+
       await new Promise<void>((resolve) => {
         const timer = setInterval(() => {
           const current = runService.getSummary(runId);
+          const timedOut = Date.now() >= deadline;
           if (
-            current &&
-            ["completed", "failed", "cancelled"].includes(current.status)
+            (current &&
+              ["completed", "failed", "cancelled"].includes(current.status)) ||
+            timedOut
           ) {
             clearInterval(timer);
+            if (timedOut && current && !["completed", "failed", "cancelled"].includes(current.status)) {
+              void send({
+                type: "error",
+                message: "Event stream timed out waiting for run completion",
+              });
+            }
             resolve();
           }
         }, 500);
@@ -89,24 +101,28 @@ export function createV1Routes(runService: RunService, token: string) {
     if (!body.success) {
       return c.json({ error: "Invalid request", details: body.error.flatten() }, 400);
     }
+    const bearerToken = extractBearerToken(c);
+    if (!bearerToken) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
     try {
-      runService.continueRun(runId, body.data.prompt);
+      runService.continueRun(runId, body.data.prompt, bearerToken);
       return c.json({ ok: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to continue run";
-      const status = message.includes("not found") ? 404 : 400;
-      return c.json({ error: message }, status);
+      return c.json({ error: message }, httpStatusForError(error));
     }
   });
 
   app.post("/runs/:id/cancel", (c) => {
     const runId = c.req.param("id");
-    const summary = runService.getSummary(runId);
-    if (!summary) {
-      return c.json({ error: "Not found" }, 404);
+    try {
+      runService.cancelRun(runId);
+      return c.json({ ok: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to cancel run";
+      return c.json({ error: message }, httpStatusForError(error));
     }
-    runService.cancelRun(runId);
-    return c.json({ ok: true });
   });
 
   return app;

@@ -5,6 +5,13 @@ import type { CreateRunRequest } from "../api-schema.js";
 import { getRepoById, getWorkspaceById, loadWorkspaces } from "../config/loader.js";
 import { RunDatabase } from "../db/client.js";
 import { agentRunner, type AgentRunner } from "../agent/runner.js";
+import {
+  ApplyTokenRequiredError,
+  RunAlreadyActiveError,
+  RunNotActiveError,
+  RunNotFoundError,
+  TooManyConcurrentRunsError,
+} from "../errors.js";
 import { createPullRequest } from "../git/publish.js";
 import {
   addWorktree,
@@ -46,6 +53,8 @@ export type RunServiceDeps = {
   maxConcurrentRuns?: number;
 };
 
+const TERMINAL_STATUSES: RunStatus[] = ["completed", "failed", "cancelled"];
+
 export class RunService {
   private readonly db: RunDatabase;
   private readonly runner: AgentRunner;
@@ -84,27 +93,14 @@ export class RunService {
       throw new Error("CURSOR_API_KEY is not configured");
     }
 
-    if (
-      request.mode === "apply" &&
-      this.secrets.remoteAgentApplyToken &&
-      !safeEqualToken(bearerToken, this.secrets.remoteAgentApplyToken)
-    ) {
-      throw new Error("Apply mode requires REMOTE_AGENT_APPLY_TOKEN");
-    }
-
-    if (this.active.size >= this.maxConcurrentRuns) {
-      throw new Error("Too many concurrent runs");
-    }
+    this.assertApplyToken(request.mode, bearerToken);
 
     const workspace = getWorkspaceById(request.workspaceId, this.configDir);
     const id = `run_${Date.now()}_${randomBytes(4).toString("hex")}`;
     const now = new Date().toISOString();
-    const runPath = runDir(id);
-    const cursorStatePath = runCursorStateDir(id);
-    const workspaceRoot = runWorkspaceDir(id);
 
-    fs.mkdirSync(cursorStatePath, { recursive: true });
-    fs.mkdirSync(workspaceRoot, { recursive: true });
+    fs.mkdirSync(runCursorStateDir(id), { recursive: true });
+    fs.mkdirSync(runWorkspaceDir(id), { recursive: true });
 
     const repoRows: RunRepoRow[] = workspace.repos.map((ref) => {
       const repo = getRepoById(ref.repoId, this.configDir);
@@ -123,8 +119,8 @@ export class RunService {
       workspaceId: workspace.id,
       status: "queued",
       mode: request.mode,
-      runPath,
-      cursorStatePath,
+      runPath: runDir(id),
+      cursorStatePath: runCursorStateDir(id),
       createdAt: now,
       updatedAt: now,
     };
@@ -134,33 +130,37 @@ export class RunService {
     return { id };
   }
 
-  continueRun(id: string, prompt: string): void {
+  continueRun(id: string, prompt: string, bearerToken: string): void {
     const run = this.requireRun(id);
+    this.assertApplyToken(run.mode, bearerToken);
+
     if (this.active.has(id) || run.status === "running") {
-      throw new Error("Run is already active");
+      throw new RunAlreadyActiveError();
     }
-    if (!["completed", "failed", "cancelled"].includes(run.status)) {
+    if (!TERMINAL_STATUSES.includes(run.status)) {
       throw new Error(`Cannot continue run in status ${run.status}`);
     }
-    if (this.active.size >= this.maxConcurrentRuns) {
-      throw new Error("Too many concurrent runs");
-    }
+
     const workspace = getWorkspaceById(run.workspaceId, this.configDir);
     this.updateStatus(id, "queued");
     this.startRun(id, prompt, workspace.defaultPromptContext);
   }
 
   cancelRun(id: string): void {
-    const active = this.active.get(id);
-    if (active) {
-      active.abortController.abort();
+    const run = this.db.getRun(id);
+    if (!run) {
+      throw new RunNotFoundError(id);
     }
-    this.finalizeRun(id, "cancelled");
-    runEventBus.publish(
-      id,
-      { type: "result", ok: false },
-      runEventsPath(id),
-    );
+    if (TERMINAL_STATUSES.includes(run.status)) {
+      return;
+    }
+
+    const active = this.active.get(id);
+    if (!active) {
+      throw new RunNotActiveError();
+    }
+
+    active.abortController.abort();
   }
 
   getSummary(id: string): RunSummary | null {
@@ -188,10 +188,20 @@ export class RunService {
     };
   }
 
+  private assertApplyToken(mode: RunRecord["mode"], bearerToken: string): void {
+    if (
+      mode === "apply" &&
+      this.secrets.remoteAgentApplyToken &&
+      !safeEqualToken(bearerToken, this.secrets.remoteAgentApplyToken)
+    ) {
+      throw new ApplyTokenRequiredError();
+    }
+  }
+
   private requireRun(id: string): RunRecord {
     const run = this.db.getRun(id);
     if (!run) {
-      throw new Error(`Run not found: ${id}`);
+      throw new RunNotFoundError(id);
     }
     return run;
   }
@@ -204,7 +214,7 @@ export class RunService {
 
   private finalizeRun(id: string, status: RunStatus): void {
     this.updateStatus(id, status);
-    if (["completed", "failed", "cancelled"].includes(status)) {
+    if (TERMINAL_STATUSES.includes(status)) {
       runEventBus.dispose(id);
     }
   }
@@ -215,7 +225,10 @@ export class RunService {
     promptContext?: string,
   ): void {
     if (this.active.has(id)) {
-      throw new Error("Run is already active");
+      throw new RunAlreadyActiveError();
+    }
+    if (this.active.size >= this.maxConcurrentRuns) {
+      throw new TooManyConcurrentRunsError();
     }
 
     const run = this.requireRun(id);
@@ -240,7 +253,12 @@ export class RunService {
   ): Promise<void> {
     try {
       this.updateStatus(run.id, "running");
-      await this.prepareWorktrees(run);
+      await this.prepareWorktrees(run, signal);
+
+      if (signal.aborted) {
+        this.endCancelled(run.id);
+        return;
+      }
 
       const result = await this.runner.run({
         runId: run.id,
@@ -257,40 +275,17 @@ export class RunService {
       });
 
       if (signal.aborted || result.error === "cancelled") {
-        this.finalizeRun(run.id, "cancelled");
-        runEventBus.publish(
-          run.id,
-          { type: "result", ok: false },
-          runEventsPath(run.id),
-        );
+        this.endCancelled(run.id);
         return;
       }
 
       if (!result.ok) {
-        this.finalizeRun(run.id, "failed");
-        runEventBus.publish(
-          run.id,
-          {
-            type: "error",
-            message: result.error ?? "Run failed",
-          },
-          runEventsPath(run.id),
-        );
-        runEventBus.publish(
-          run.id,
-          { type: "result", ok: false },
-          runEventsPath(run.id),
-        );
+        this.endFailed(run.id, result.error ?? "Run failed");
         return;
       }
 
       if (signal.aborted) {
-        this.finalizeRun(run.id, "cancelled");
-        runEventBus.publish(
-          run.id,
-          { type: "result", ok: false },
-          runEventsPath(run.id),
-        );
+        this.endCancelled(run.id);
         return;
       }
 
@@ -305,39 +300,62 @@ export class RunService {
       }
 
       if (signal.aborted) {
-        this.finalizeRun(run.id, "cancelled");
-        runEventBus.publish(
-          run.id,
-          { type: "result", ok: false },
-          runEventsPath(run.id),
-        );
+        this.endCancelled(run.id);
         return;
       }
 
-      this.finalizeRun(run.id, "completed");
-      runEventBus.publish(
-        run.id,
-        { type: "result", ok: true },
-        runEventsPath(run.id),
-      );
+      this.endCompleted(run.id);
     } catch (error) {
-      this.finalizeRun(run.id, "failed");
-      runEventBus.publish(
-        run.id,
-        { type: "error", message: clientErrorMessage(error, "run") },
-        runEventsPath(run.id),
-      );
-      runEventBus.publish(
-        run.id,
-        { type: "result", ok: false },
-        runEventsPath(run.id),
-      );
+      this.endFailed(run.id, clientErrorMessage(error, "run"));
     }
   }
 
-  private async prepareWorktrees(run: RunRecord): Promise<void> {
+  private endCancelled(runId: string): void {
+    this.finalizeRun(runId, "cancelled");
+    runEventBus.publish(
+      runId,
+      { type: "result", ok: false },
+      runEventsPath(runId),
+    );
+  }
+
+  private endFailed(runId: string, message: string): void {
+    this.finalizeRun(runId, "failed");
+    runEventBus.publish(
+      runId,
+      { type: "error", message },
+      runEventsPath(runId),
+    );
+    runEventBus.publish(
+      runId,
+      { type: "result", ok: false },
+      runEventsPath(runId),
+    );
+  }
+
+  private endCompleted(runId: string): void {
+    this.finalizeRun(runId, "completed");
+    runEventBus.publish(
+      runId,
+      { type: "result", ok: true },
+      runEventsPath(runId),
+    );
+  }
+
+  private async prepareWorktrees(
+    run: RunRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const worktreesReadyPath = path.join(runDir(run.id), "worktrees.ready");
+    if (fs.existsSync(worktreesReadyPath)) {
+      return;
+    }
+
     const repos = this.db.listRunRepos(run.id);
     for (const row of repos) {
+      if (signal.aborted) {
+        return;
+      }
       const repo = getRepoById(row.repoId, this.configDir);
       const barePath = await ensureBareRepoCache(
         row.repoId,
@@ -350,6 +368,8 @@ export class RunService {
       await addWorktree(barePath, worktreePath, branch, baseRef);
       this.db.updateRunRepoBranch(run.id, row.repoId, branch, null);
     }
+
+    fs.writeFileSync(worktreesReadyPath, new Date().toISOString(), "utf8");
   }
 
   private async publishChanges(
@@ -358,49 +378,63 @@ export class RunService {
   ): Promise<void> {
     const repos = this.db.listRunRepos(run.id);
     const branches: Record<string, { branch: string; prUrl?: string }> = {};
+    let publishError: Error | undefined;
 
     for (const row of repos) {
       if (signal.aborted) {
         return;
       }
 
-      const worktreePath = path.join(runWorkspaceDir(run.id), row.path);
-      const branch = row.branch ?? `cursor/${run.id}-${row.role}`;
-      const dirty = await hasChanges(worktreePath);
-      if (!dirty) {
-        continue;
+      try {
+        const worktreePath = path.join(runWorkspaceDir(run.id), row.path);
+        const branch = row.branch ?? `cursor/${run.id}-${row.role}`;
+        const dirty = await hasChanges(worktreePath);
+        if (!dirty) {
+          continue;
+        }
+
+        await commitAllIfDirty(worktreePath, `cursor: ${run.id} (${row.role})`);
+
+        if (signal.aborted) {
+          return;
+        }
+
+        await pushBranch(worktreePath, branch);
+
+        if (signal.aborted) {
+          return;
+        }
+
+        const prUrl = await createPullRequest({
+          cwd: worktreePath,
+          branch,
+          base: row.baseRef,
+          title: `Cursor run ${run.id} (${row.role})`,
+          body: `Automated changes from remote agent run \`${run.id}\`.`,
+        });
+
+        this.db.updateRunRepoBranch(run.id, row.repoId, branch, prUrl);
+        branches[row.repoId] = { branch, prUrl: prUrl ?? undefined };
+
+        fs.writeFileSync(
+          runBranchesPath(run.id),
+          JSON.stringify(branches, null, 2),
+          "utf8",
+        );
+      } catch (error) {
+        publishError =
+          error instanceof Error ? error : new Error("Publish failed");
+        fs.writeFileSync(
+          runBranchesPath(run.id),
+          JSON.stringify({ ...branches, partial: true }, null, 2),
+          "utf8",
+        );
+        break;
       }
-
-      await commitAllIfDirty(worktreePath, `cursor: ${run.id} (${row.role})`);
-
-      if (signal.aborted) {
-        return;
-      }
-
-      await pushBranch(worktreePath, branch);
-
-      if (signal.aborted) {
-        return;
-      }
-
-      const prUrl = await createPullRequest({
-        cwd: worktreePath,
-        branch,
-        base: row.baseRef,
-        title: `Cursor run ${run.id} (${row.role})`,
-        body: `Automated changes from remote agent run \`${run.id}\`.`,
-      });
-
-      this.db.updateRunRepoBranch(run.id, row.repoId, branch, prUrl);
-      branches[row.repoId] = { branch, prUrl: prUrl ?? undefined };
     }
 
-    if (!signal.aborted) {
-      fs.writeFileSync(
-        runBranchesPath(run.id),
-        JSON.stringify(branches, null, 2),
-        "utf8",
-      );
+    if (publishError) {
+      throw publishError;
     }
   }
 }

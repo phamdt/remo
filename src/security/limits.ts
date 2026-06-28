@@ -15,3 +15,13 @@ export function getRunTimeoutMs(): number {
   }
   return Math.floor(parsed);
 }
+
+/** Max time an SSE client waits for a run to reach terminal status. */
+export function getSseMaxWaitMs(): number {
+  const raw = process.env.SSE_MAX_WAIT_MS ?? String(getRunTimeoutMs() + 300_000);
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 60_000) {
+    return getRunTimeoutMs() + 300_000;
+  }
+  return Math.floor(parsed);
+}

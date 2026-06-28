@@ -9,6 +9,7 @@ import {
 import { runAgentMetaPath } from "../paths.js";
 import { buildAgentHostEnv } from "../security/env.js";
 import { clientAgentErrorMessage } from "../security/errors.js";
+import { sanitizeLogMessage } from "../security/log-sanitize.js";
 import type { RunMode } from "../types.js";
 import { runEventBus } from "../services/event-bus.js";
 
@@ -132,7 +133,7 @@ export class AgentRunner {
           if (update.type === "text-delta") {
             runEventBus.publish(
               options.runId,
-              { type: "log", message: update.text },
+              { type: "log", message: sanitizeLogMessage(update.text) },
               options.eventsPath,
             );
           }

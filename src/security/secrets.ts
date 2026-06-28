@@ -43,6 +43,12 @@ export function initializeSecrets(): AppSecrets {
     delete process.env[key];
   }
 
+  if (!secrets.remoteAgentApplyToken) {
+    console.warn(
+      "[security] REMOTE_AGENT_APPLY_TOKEN is not set — any bearer holder can create apply runs",
+    );
+  }
+
   return secrets;
 }
 

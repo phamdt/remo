@@ -11,7 +11,13 @@ import type { RunService } from "../services/run-service.js";
 import { runEventBus } from "../services/event-bus.js";
 import type { SseEvent } from "../types.js";
 
-export function createV1Routes(runService: RunService, token: string) {
+/** Route handlers only need these methods (tests mock this shape). */
+export type V1RunService = Pick<
+  RunService,
+  "listWorkspaces" | "createRun" | "getSummary" | "continueRun" | "cancelRun"
+>;
+
+export function createV1Routes(runService: V1RunService, token: string) {
   const app = new Hono();
 
   app.use("*", bearerAuth(token));

@@ -1,14 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { createV1Routes } from "../src/routes/v1.js";
-import type { RunService } from "../src/services/run-service.js";
+import type { V1RunService } from "../src/routes/v1.js";
 
-function mockRunService(overrides: Partial<RunService> = {}): RunService {
+function mockRunService(overrides: Partial<V1RunService> = {}): V1RunService {
   return {
     listWorkspaces: () => [
       {
         id: "demo-workspace",
         name: "Demo",
         repos: [{ repoId: "demo-api", role: "api", path: "api" }],
+        defaultPromptContext: undefined,
       },
     ],
     createRun: () => ({ id: "run_123" }),
@@ -27,7 +28,7 @@ function mockRunService(overrides: Partial<RunService> = {}): RunService {
     continueRun: () => undefined,
     cancelRun: () => undefined,
     ...overrides,
-  } as RunService;
+  };
 }
 
 describe("v1 routes", () => {

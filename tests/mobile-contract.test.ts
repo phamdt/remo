@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createV1Routes } from "../src/routes/v1.js";
-import type { RunService } from "../src/services/run-service.js";
+import type { V1RunService } from "../src/routes/v1.js";
 
 /**
  * Contract shapes expected by remomo (RemoteAgentApi.kt / ApiModels.kt).
@@ -9,7 +9,7 @@ import type { RunService } from "../src/services/run-service.js";
 const token = "mobile-contract-token";
 const auth = { Authorization: `Bearer ${token}` };
 
-function mockRunService(): RunService {
+function mockRunService(): V1RunService {
   return {
     listWorkspaces: () => [
       {
@@ -43,7 +43,7 @@ function mockRunService(): RunService {
         : null,
     continueRun: () => undefined,
     cancelRun: () => undefined,
-  } as RunService;
+  };
 }
 
 describe("remomo mobile contract", () => {
